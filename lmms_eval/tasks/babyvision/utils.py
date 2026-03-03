@@ -19,41 +19,67 @@ from azure.identity import (
     ManagedIdentityCredential,
     get_bearer_token_provider,
 )
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 
 
 # ============================================================================
-# Azure TRAPI Client for LLM Judge
+# LLM Judge Client (Azure TRAPI or OpenAI)
 # ============================================================================
 
-_JUDGE_CLIENT = None
-_JUDGE_DEPLOYMENT = None
 
+class AzureJudgeClient:
+    """Azure TRAPI client for LLM Judge."""
 
-def get_judge_client():
-    """Get or create Azure OpenAI client for LLM Judge."""
-    global _JUDGE_CLIENT, _JUDGE_DEPLOYMENT
-
-    if _JUDGE_CLIENT is None:
+    def __init__(self) -> None:
         scope = os.getenv("TRAPI_SCOPE", "api://trapi/.default")
-        api_version = os.getenv("TRAPI_API_VERSION", "2024-10-21")
-        _JUDGE_DEPLOYMENT = os.getenv("TRAPI_DEPLOYMENT", "gpt-4o_2024-11-20")
+        self.deployment = os.getenv("TRAPI_DEPLOYMENT", "gpt-4o_2024-11-20")
         instance = os.getenv("TRAPI_INSTANCE", "gcr/shared")
+        api_version = os.getenv("TRAPI_API_VERSION", "2024-10-21")
         endpoint = f"https://trapi.research.microsoft.com/{instance}"
 
-        chained = ChainedTokenCredential(
-            AzureCliCredential(),
-            ManagedIdentityCredential(),
+        credential_provider = get_bearer_token_provider(
+            ChainedTokenCredential(AzureCliCredential(), ManagedIdentityCredential()),
+            scope,
         )
-        credential_provider = get_bearer_token_provider(chained, scope)
-
-        _JUDGE_CLIENT = AzureOpenAI(
+        self.client = AzureOpenAI(
             azure_endpoint=endpoint,
             azure_ad_token_provider=credential_provider,
             api_version=api_version,
         )
 
-    return _JUDGE_CLIENT, _JUDGE_DEPLOYMENT
+    def chat_completion(self, *, messages, **kwargs) -> str:
+        resp = self.client.chat.completions.create(model=self.deployment, messages=messages, **kwargs)
+        return resp.choices[0].message.content
+
+
+class OpenAIJudgeClient:
+    """OpenAI client for LLM Judge."""
+
+    def __init__(self) -> None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY must be set for OpenAI judge.")
+        base_url = os.getenv("OPENAI_BASE_URL")
+        self.deployment = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4o")
+        self.client = OpenAI(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+
+    def chat_completion(self, *, messages, **kwargs) -> str:
+        resp = self.client.chat.completions.create(model=self.deployment, messages=messages, **kwargs)
+        return resp.choices[0].message.content
+
+
+_JUDGE_CLIENT: AzureJudgeClient | OpenAIJudgeClient | None = None
+
+
+def get_judge_client() -> AzureJudgeClient | OpenAIJudgeClient:
+    """Get or create LLM Judge client (Azure or OpenAI based on env)."""
+    global _JUDGE_CLIENT
+    if _JUDGE_CLIENT is None:
+        if os.getenv("OPENAI_API_KEY"):
+            _JUDGE_CLIENT = OpenAIJudgeClient()
+        else:
+            _JUDGE_CLIENT = AzureJudgeClient()
+    return _JUDGE_CLIENT
 
 
 LLM_JUDGE_PROMPT = """You are a careful and strict evaluator. You will be given:
@@ -81,7 +107,7 @@ Model Output: {modeloutput}
 
 def call_judge(question: str, groundtruth: str, modeloutput: str) -> bool:
     """Call LLM Judge to evaluate answer correctness."""
-    client, deployment = get_judge_client()
+    client = get_judge_client()
 
     prompt = LLM_JUDGE_PROMPT.format(
         question=question,
@@ -90,13 +116,11 @@ def call_judge(question: str, groundtruth: str, modeloutput: str) -> bool:
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=deployment,
+        response_text = client.chat_completion(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=16,
             temperature=0,
-        )
-        response_text = resp.choices[0].message.content.strip().lower()
+        ).strip().lower()
         return "true" in response_text
     except Exception as e:
         eval_logger.error(f"[LLM Judge Error] {e}")

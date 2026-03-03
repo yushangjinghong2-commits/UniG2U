@@ -52,13 +52,65 @@ uv run python -m lmms_eval \
   --output_path "${OUTPUT_BASE}/${TASK}"
 ```
 
-## Prerequisites
+## LLM Judge API
 
-- The repository dependencies are already installed in the current environment
-- `uv` is available from the command line
-- The target model is implemented in `lmms_eval` and `--model_args` is valid
-- Required datasets, access permissions, and API keys have been configured as
-  described in the main project README
+Several tasks use an LLM as a judge to evaluate model outputs instead of exact
+string matching. The judge client supports two backends: **Azure TRAPI** and
+**standard OpenAI** (or any OpenAI-compatible endpoint).
+
+Tasks that require a judge API:
+
+| Task | Purpose |
+|------|---------|
+| `auxsolidmath_easy` | Solid geometry reasoning correctness |
+| `geometry3k` | Plane geometry answer equivalence |
+| `babyvision` | Fine-grained discrimination and visual tracking |
+| `phyx_simple` | Physics MC answer matching |
+
+### Backend selection
+
+The backend is chosen automatically at runtime:
+
+- **OpenAI** — if `OPENAI_API_KEY` is set
+- **Azure TRAPI** — otherwise (uses `AzureCliCredential` / `ManagedIdentityCredential`)
+
+### Environment variables
+
+#### OpenAI backend
+
+```bash
+export OPENAI_API_KEY=sk-...          # required
+export OPENAI_JUDGE_MODEL=gpt-4o     # optional, default: gpt-4o
+export OPENAI_BASE_URL=https://...   # optional, for third-party endpoints
+```
+
+#### Azure TRAPI backend
+
+```bash
+export TRAPI_INSTANCE=gcr/shared         # optional, default: gcr/shared
+export TRAPI_DEPLOYMENT=gpt-4o_2024-11-20  # optional
+export TRAPI_SCOPE=api://trapi/.default  # optional
+export TRAPI_API_VERSION=2024-10-21     # optional
+```
+
+Azure TRAPI authenticates via `az login` (AzureCliCredential) or managed
+identity (ManagedIdentityCredential) — no explicit API key needed.
+
+### Quick start
+
+```bash
+# Use OpenAI as judge
+export OPENAI_API_KEY=sk-...
+bash script/eval_all.sh --model qwen2_5_vl \
+  --model_args "pretrained=Qwen/Qwen2.5-VL-3B-Instruct"
+
+# Use Azure TRAPI as judge (requires az login)
+az login
+bash script/eval_all.sh --model qwen2_5_vl \
+  --model_args "pretrained=Qwen/Qwen2.5-VL-3B-Instruct"
+```
+
+
 
 If your environment is not managed with `uv`, replace `uv run python` in the
 scripts with your preferred Python launcher.

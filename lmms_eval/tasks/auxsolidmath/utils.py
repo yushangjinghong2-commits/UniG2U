@@ -4,53 +4,79 @@ Evaluation for solid geometry problems with auxiliary line construction.
 """
 
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional
 
+from azure.identity import (
+    AzureCliCredential,
+    ChainedTokenCredential,
+    ManagedIdentityCredential,
+    get_bearer_token_provider,
+)
+from openai import AzureOpenAI, OpenAI
 from PIL import Image
 
-# Azure TRAPI client for Judge evaluation (reuse from uni_mmmu)
-_JUDGE_CLIENT = None
-_JUDGE_DEPLOYMENT = None
+
+# ============================================================================
+# LLM Judge Client (Azure TRAPI or OpenAI)
+# ============================================================================
 
 
-def _get_judge_client():
-    """Get or create Azure OpenAI client for Judge evaluation (singleton)"""
-    global _JUDGE_CLIENT, _JUDGE_DEPLOYMENT
-    if _JUDGE_CLIENT is None:
-        import os
+class AzureJudgeClient:
+    """Azure TRAPI client for LLM Judge."""
 
-        from azure.identity import AzureCliCredential, get_bearer_token_provider
-        from openai import AzureOpenAI
+    def __init__(self) -> None:
+        scope = os.getenv("TRAPI_SCOPE", "api://trapi/.default")
+        self.deployment = os.getenv("TRAPI_DEPLOYMENT", "gpt-4o_2024-11-20")
+        instance = os.getenv("TRAPI_INSTANCE", "gcr/shared")
+        api_version = os.getenv("TRAPI_API_VERSION", "2024-10-21")
+        endpoint = f"https://trapi.research.microsoft.com/{instance}"
 
-        endpoint = os.getenv(
-            "AZURE_OPENAI_ENDPOINT",
-            "https://mcg-vision-flow-oai-eus2.openai.azure.com/",
+        credential_provider = get_bearer_token_provider(
+            ChainedTokenCredential(AzureCliCredential(), ManagedIdentityCredential()),
+            scope,
         )
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+        self.client = AzureOpenAI(
+            azure_endpoint=endpoint,
+            azure_ad_token_provider=credential_provider,
+            api_version=api_version,
+        )
 
-        # Try API key first, fall back to Azure CLI credential
-        api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        if api_key:
-            _JUDGE_CLIENT = AzureOpenAI(
-                azure_endpoint=endpoint,
-                api_key=api_key,
-                api_version=api_version,
-            )
+    def chat_completion(self, *, messages, **kwargs) -> str:
+        resp = self.client.chat.completions.create(model=self.deployment, messages=messages, **kwargs)
+        return resp.choices[0].message.content
+
+
+class OpenAIJudgeClient:
+    """OpenAI client for LLM Judge."""
+
+    def __init__(self) -> None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY must be set for OpenAI judge.")
+        base_url = os.getenv("OPENAI_BASE_URL")
+        self.deployment = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4o")
+        self.client = OpenAI(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+
+    def chat_completion(self, *, messages, **kwargs) -> str:
+        resp = self.client.chat.completions.create(model=self.deployment, messages=messages, **kwargs)
+        return resp.choices[0].message.content
+
+
+_JUDGE_CLIENT: AzureJudgeClient | OpenAIJudgeClient | None = None
+
+
+def _get_judge_client() -> AzureJudgeClient | OpenAIJudgeClient:
+    """Get or create LLM Judge client (Azure or OpenAI based on env)."""
+    global _JUDGE_CLIENT
+    if _JUDGE_CLIENT is None:
+        if os.getenv("OPENAI_API_KEY"):
+            _JUDGE_CLIENT = OpenAIJudgeClient()
         else:
-            # Use Azure CLI credential
-            scope = os.getenv(
-                "AZURE_OPENAI_SCOPE", "https://cognitiveservices.azure.com/.default"
-            )
-            token_provider = get_bearer_token_provider(AzureCliCredential(), scope)
-            _JUDGE_CLIENT = AzureOpenAI(
-                azure_endpoint=endpoint,
-                azure_ad_token_provider=token_provider,
-                api_version=api_version,
-            )
-        _JUDGE_DEPLOYMENT = os.getenv("JUDGE_DEPLOYMENT", "gpt-5.1")
-    return _JUDGE_CLIENT, _JUDGE_DEPLOYMENT
+            _JUDGE_CLIENT = AzureJudgeClient()
+    return _JUDGE_CLIENT
 
 
 def _find_first_json_substring(text: str) -> Optional[str]:
@@ -197,7 +223,7 @@ def auxsolidmath_process_results(doc: Dict, results: List[str]) -> Dict[str, flo
 
     # Get Judge client
     try:
-        judge_client, judge_deployment = _get_judge_client()
+        judge_client = _get_judge_client()
     except Exception as e:
         print(f"Warning: Failed to initialize Judge client: {e}")
         return {
@@ -242,16 +268,14 @@ Evaluate the candidate. Output JSON only."""
 
         for attempt in range(3):
             try:
-                response = judge_client.chat.completions.create(
-                    model=judge_deployment,
+                response_text = judge_client.chat_completion(
                     messages=[
                         {"role": "system", "content": text_system},
                         {"role": "user", "content": text_user},
                     ],
                     temperature=0.0,
-                    max_completion_tokens=512,
+                    max_tokens=512,
                 )
-                response_text = response.choices[0].message.content
                 result_json = _find_first_json_substring(response_text)
                 if result_json:
                     data = json.loads(result_json)
